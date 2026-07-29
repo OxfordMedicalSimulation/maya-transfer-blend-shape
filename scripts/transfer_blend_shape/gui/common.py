@@ -1,7 +1,7 @@
-import six
+
 import sys
-import shiboken2
-from PySide2 import QtCore, QtWidgets
+import shiboken6
+from PySide6 import QtCore, QtWidgets
 from functools import wraps
 
 
