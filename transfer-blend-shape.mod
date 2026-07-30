@@ -5,3 +5,4 @@
 + MAYAVERSION:2022 transfer-blend-shape 1.1.1 <PATH>
 + MAYAVERSION:2023 transfer-blend-shape 1.1.1 <PATH>
 + MAYAVERSION:2024 transfer-blend-shape 1.1.1 <PATH>
++ MAYAVERSION:2026 transfer-blend-shape 1.1.1 <PATH>

@@ -1,5 +1,5 @@
 from maya import cmds
-from PySide2 import QtWidgets, QtGui, QtCore
+from PySide6 import QtWidgets, QtGui, QtCore
 
 from transfer_blend_shape import transfer
 from transfer_blend_shape.gui import dcc
