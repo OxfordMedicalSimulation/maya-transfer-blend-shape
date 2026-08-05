@@ -72,10 +72,16 @@ transfer.set_shell_stiffness(0.0, index=1)    # let shell 1 deform, eg the lashe
 transfer.execute_from_blend_shape()
 ```
 
-Following gives a shell the motion implied by the skin underneath it. When a 
-modeller has deliberately pushed a card further than the skin, that intent is 
-not part of the skin and is lost. Enabling `preserve_source_offset` measures 
-the leftover rigid motion on the source and transplants it onto the target.
+A shell's motion is transferred *relative* to the skin rather than simply 
+replaying the skin's motion, controlled by `preserve_source_offset` and on by 
+default. Plain following gives a shell exactly the motion implied by the skin 
+underneath it, which sounds like the safe choice but cannot express two common 
+shapes: one that moves only the eyebrow cards has no skin motion to follow and 
+transfers as a no-op, and one that moves the jaw while deliberately holding the 
+brows still drags the brows along with the cheek. Measuring the leftover rigid 
+motion on the source and transplanting it onto the target covers both, and 
+reduces to plain following whenever the author did move the shell with the skin. 
+A shell the author left untouched is always left untouched.
 
 The transfer still creates one mesh per shape, exactly as before. The maths runs 
 without a Maya session, so it is covered by tests that can be run directly:

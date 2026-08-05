@@ -51,7 +51,7 @@ class Transfer(object):
             create_colour_sets=False,
             shell_stiffness=1.0,
             shell_neighbours=8,
-            preserve_source_offset=False,
+            preserve_source_offset=True,
             solve_detached_shells=False
     ):
         self._source_mesh = None
@@ -63,7 +63,7 @@ class Transfer(object):
         self._shell_stiffness = 1.0
         self._shell_stiffness_overrides = {}
         self._shell_neighbours = 8
-        self._preserve_source_offset = False
+        self._preserve_source_offset = True
         self._solve_detached_shells = False
 
         self.set_source_mesh(source_mesh)
@@ -392,10 +392,19 @@ class Transfer(object):
 
     def set_preserve_source_offset(self, state):
         """
-        Following alone gives a shell the motion implied by the skin underneath
-        it. When a modeller has deliberately moved a card further than the skin
-        that intent is lost. Enabling this measures the leftover rigid motion on
-        the source and transplants it onto the target.
+        Transfer a shell's motion *relative* to the skin rather than simply
+        replaying the skin's motion, which is on by default.
+
+        Following alone gives a shell exactly the motion implied by the skin
+        underneath it, so anything the author did on top of that is dropped. Two
+        cases make that visible. A shape that moves only the eyebrow cards and
+        leaves the skin alone has nothing to follow and transfers as a no-op.
+        A shape that moves the jaw while deliberately holding the brows still
+        drags the brows along with the cheek.
+
+        Measuring the leftover rigid motion on the source and transplanting it
+        onto the target covers both, and reduces to plain following whenever the
+        author did move the shell with the skin.
 
         :param bool state:
         :raise TypeError: When state is not a bool.
@@ -764,11 +773,11 @@ class Transfer(object):
         stiffness = {int(label): self.get_shell_stiffness(int(label))
                      for label in numpy.unique(labels)}
 
+        followers = self.get_follower_vertices()
+        source_points = self.get_source_points()
         followed = shell.evaluate_binding(binding, skin_points, stiffness, labels)
 
         if self.preserve_source_offset:
-            followers = self.get_follower_vertices()
-            source_points = self.get_source_points()
             predicted = shell.evaluate_binding(
                 self.get_source_shell_binding(),
                 points[self.get_skin_vertices()],
@@ -777,6 +786,17 @@ class Transfer(object):
             )
             followed = shell.transplant_source_offset(
                 followed, predicted, points[followers], source_points[followers], labels)
+
+        # A shell the author left untouched must stay untouched. Following would
+        # otherwise drag a static eyebrow along with a moving jaw, where the
+        # original tool left it alone. Deltas are measured on the source with the
+        # same threshold used to pick the static vertices.
+        deltas = scipy.linalg.norm(points[followers] - source_points[followers], axis=1)
+        rest = binding["follower_rest"]
+        for label in numpy.unique(labels):
+            indices = numpy.nonzero(labels == label)[0]
+            if not numpy.any(deltas[indices] > self.threshold):
+                followed[indices] = rest[indices]
 
         if not numpy.all(numpy.isfinite(followed)):
             raise RuntimeError("Derived non-finite positions for the detached shells of "
@@ -856,9 +876,10 @@ class Transfer(object):
 
             if not numpy.all(numpy.isfinite(deformed_points)):
                 raise RuntimeError(
-                    "Solve for target '{}' produced non-finite positions, which means the "
-                    "system is singular. This happens when a shell has no static vertex to "
-                    "anchor it.".format(name))
+                    "Solve for target '{}' produced non-finite positions, so the system is "
+                    "singular. Either a detached shell has no static vertex to anchor it, "
+                    "or the mesh has vertices that belong to no face, for example a stray "
+                    "wire edge, whose position nothing constrains.".format(name))
 
             target_points[solve_vertices, :] = deformed_points
 

@@ -200,12 +200,25 @@ def build_binding(follower_points, skin_points, skin_connectivity, num_neighbour
         ring_index[i, :len(indices)] = indices
         ring_mask[i, :len(indices)] = 1.0
 
+    # a ring that is collinear, or a valence one vertex sitting on top of its
+    # only neighbour, leaves the rotation about its own axis undetermined. Rank
+    # is a rest pose property so it is resolved once, here, and those vertices
+    # are then excluded from the blend rather than allowed to contribute a
+    # rotation that is only partly defined.
+    ring_valid = _ring_rank_is_sufficient(skin_points, ring_index, ring_mask)
+    if not numpy.all(ring_valid):
+        log.debug("%d of %d skin rings are rank deficient and will not contribute "
+                  "a rotation.", int(numpy.count_nonzero(~ring_valid)), len(skin_points))
+
     # nearest skin vertices per follower vertex, with a smooth adaptive kernel
     k = int(min(num_neighbours, len(skin_points)))
     tree = scipy.spatial.cKDTree(skin_points)
     distances, neighbour_index = tree.query(follower_points, k=k)
-    distances = numpy.atleast_2d(distances.astype(float))
-    neighbour_index = numpy.atleast_2d(neighbour_index)
+
+    # cKDTree drops the neighbour axis entirely when k is 1, and atleast_2d
+    # would prepend it instead of appending, transposing the whole table
+    distances = numpy.asarray(distances, dtype=float).reshape(len(follower_points), -1)
+    neighbour_index = numpy.asarray(neighbour_index).reshape(len(follower_points), -1)
 
     bandwidth = distances[:, -1:].copy()
     bandwidth[bandwidth < EPS] = 1.0
@@ -217,14 +230,53 @@ def build_binding(follower_points, skin_points, skin_connectivity, num_neighbour
         total[degenerate] = float(k)
     weights /= total
 
+    # weights used for orientation only, dropping the unusable rings. Where a
+    # follower has no usable ring at all the blend falls back to the identity,
+    # which leaves it translating with the skin rather than guessing a rotation.
+    rotation_weights = weights * ring_valid[neighbour_index]
+    rotation_total = rotation_weights.sum(axis=1, keepdims=True)
+    usable = (rotation_total > EPS).ravel()
+    rotation_weights[usable] /= rotation_total[usable]
+    rotation_weights[~usable] = 0.0
+
     return {
         "ring_index": ring_index,
         "ring_mask": ring_mask,
+        "ring_valid": ring_valid,
         "skin_rest": skin_points,
         "follower_rest": follower_points,
         "neighbour_index": neighbour_index,
         "neighbour_weight": weights,
+        "rotation_weight": rotation_weights,
     }
+
+
+def _ring_rank_is_sufficient(points, ring_index, ring_mask, ratio=1e-4):
+    """Whether each padded 1-ring spans at least a plane, vectorised.
+
+    The squared singular values of the centred ring are the eigenvalues of its
+    covariance, so this avoids one SVD per vertex on a production head.
+
+    :param numpy.ndarray points: (P, 3) rest positions.
+    :param numpy.ndarray ring_index: (P, R) padded ring table.
+    :param numpy.ndarray ring_mask: (P, R) padding mask.
+    :param float ratio: Minimum second/first singular value ratio.
+    :return: (P,) boolean, True where the ring determines a rotation.
+    :rtype: numpy.ndarray
+    """
+    mask = ring_mask[..., None]
+    counts = ring_mask.sum(axis=1, keepdims=True)
+    ring = points[ring_index]
+    centred = (ring - ((ring * mask).sum(axis=1) / counts)[:, None, :]) * mask
+
+    eigenvalues = numpy.linalg.eigvalsh(numpy.einsum("prk,prl->pkl", centred, centred))
+    largest = eigenvalues[:, 2]
+    middle = numpy.clip(eigenvalues[:, 1], 0.0, None)
+
+    valid = largest > EPS
+    result = numpy.zeros(len(points), dtype=float)
+    result[valid] = numpy.sqrt(middle[valid] / largest[valid])
+    return result >= ratio
 
 
 def _local_rotations(binding, skin_deformed):
@@ -286,9 +338,19 @@ def evaluate_binding(binding, skin_deformed, stiffness=1.0, shell_labels=None):
 
     # blend the neighbouring local frames, then re-orthogonalise. Blending
     # identical rotations returns that rotation untouched, which is what makes
-    # the rest pose and rigid motion cases exact.
-    blended = project_to_rotation(
-        (rotations[neighbour_index] * weights[..., None]).sum(axis=1))
+    # the rest pose and rigid motion cases exact. Rings that cannot define a
+    # rotation are already weighted out, and a follower with no usable ring at
+    # all falls back to the identity.
+    rotation_weight = binding.get("rotation_weight")
+    if rotation_weight is None:
+        rotation_weight = binding["neighbour_weight"]
+
+    blended = (rotations[neighbour_index] * rotation_weight[..., None, None]).sum(axis=1)
+    unusable = rotation_weight.sum(axis=1) <= EPS
+    if numpy.any(unusable):
+        blended[unusable] = numpy.eye(3)
+
+    blended = project_to_rotation(blended)
 
     # the rest and deformed anchors must be the same weighted combination of the
     # same skin vertices, otherwise the rest pose would not round trip exactly
@@ -315,12 +377,17 @@ def evaluate_binding(binding, skin_deformed, stiffness=1.0, shell_labels=None):
             r, t = kabsch(rest, smooth[indices])
             rigid = rest.dot(r.T) + t
         else:
-            # a one/two vertex or perfectly collinear shell leaves the rotation
-            # about its own axis undetermined, so only translate it
-            if len(indices) >= 3:
-                log.debug("Shell %s is near collinear, following by translation only.",
-                          int(label))
-            rigid = rest + (smooth[indices] - rest).mean(axis=0)
+            # A single row strip, two vertices, or a perfectly collinear shell
+            # cannot be fitted by Kabsch, its own points leave the rotation about
+            # their shared axis undetermined. The skin underneath does define
+            # that rotation though, so take it from the blended field rather
+            # than dropping it, which would leave a lash strip facing its rest
+            # direction while the head turns.
+            log.debug("Shell %s cannot be fitted from its own points, taking the "
+                      "rotation from the skin.", int(label))
+            r = project_to_rotation(blended[indices].mean(axis=0))
+            centre = rest.mean(axis=0)
+            rigid = (rest - centre).dot(r.T) + smooth[indices].mean(axis=0)
 
         out[indices] = (rigid if amount >= 1.0
                         else amount * rigid + (1.0 - amount) * smooth[indices])

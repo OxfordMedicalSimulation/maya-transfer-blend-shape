@@ -394,9 +394,15 @@ class TestWorldZeroRegression(unittest.TestCase):
                 points[ids], shape[ids], atol=1e-7,
                 err_msg="card {} not reproduced under identity transfer".format(index))
 
-    def test_source_offset_is_off_by_default(self):
+    def test_source_offset_is_on_by_default(self):
+        """Transferring motion relative to the skin is the correct model.
+
+        Plain following cannot express a shell that moves without the skin, nor
+        a shell held still while the skin moves, so it is not the safe default
+        it first appears to be.
+        """
         t = self.asset.transfer()
-        self.assertFalse(t.preserve_source_offset)
+        self.assertTrue(t.preserve_source_offset)
 
     def test_shell_description_drives_the_interface(self):
         t = self.asset.transfer()
@@ -441,6 +447,158 @@ class TestWorldZeroRegression(unittest.TestCase):
                                   - pairwise(self.asset.target()[ids])).max()
                 self.assertLess(error, 1e-9,
                                 "cards must stay rigid at {} neighbours".format(num))
+
+
+class TestReviewFindings(unittest.TestCase):
+    """Regressions for defects found reviewing the first cut of this fix."""
+
+    @staticmethod
+    def rotation(seed):
+        return TestShellMaths.rotation(seed)
+
+    def skin_binding(self, asset, follower_points, num_neighbours=8):
+        skin = asset.points[asset.skin]
+        return shell.build_binding(
+            follower_points, skin,
+            [[j for j in asset.connectivity[i]] for i in asset.skin],
+            num_neighbours)
+
+    def test_single_neighbour_does_not_transpose_the_tables(self):
+        """cKDTree drops the neighbour axis at k=1, atleast_2d would transpose."""
+        asset = Asset()
+        followers = asset.points[asset.followers]
+        binding = self.skin_binding(asset, followers, num_neighbours=1)
+
+        self.assertEqual(binding["neighbour_index"].shape, (len(followers), 1))
+        self.assertEqual(binding["neighbour_weight"].shape, (len(followers), 1))
+
+        # with the tables transposed every follower shared one transform, so
+        # two cards over different skin ended up with identical displacement
+        skin = asset.points[asset.skin]
+        deformed = skin.copy()
+        deformed[:, 2] += 0.4 * numpy.sin(skin[:, 0])
+        out = shell.evaluate_binding(binding, deformed, stiffness=0.0)
+
+        first = out[:4].mean(axis=0) - followers[:4].mean(axis=0)
+        second = out[8:12].mean(axis=0) - followers[8:12].mean(axis=0)
+        self.assertGreater(numpy.linalg.norm(first - second), 1e-6,
+                           "shells over different skin must not move identically")
+
+    def test_neighbour_counts_all_round_trip(self):
+        asset = Asset()
+        followers = asset.points[asset.followers]
+        skin = asset.points[asset.skin]
+        r, t = self.rotation(5), numpy.array([2.0, -1.0, 4.0])
+        for num in (1, 2, 3, 8, 16):
+            binding = self.skin_binding(asset, followers, num_neighbours=num)
+            for stiffness in (0.0, 1.0):
+                numpy.testing.assert_allclose(
+                    shell.evaluate_binding(binding, skin, stiffness=stiffness),
+                    followers, atol=1e-9,
+                    err_msg="rest pose at {} neighbours".format(num))
+                numpy.testing.assert_allclose(
+                    shell.evaluate_binding(binding, skin.dot(r.T) + t, stiffness=stiffness),
+                    followers.dot(r.T) + t, atol=1e-7,
+                    err_msg="rigid motion at {} neighbours".format(num))
+
+    def test_collinear_shells_still_rotate_with_the_head(self):
+        """A single row strip cannot be Kabsch fitted from its own points.
+
+        The rotation is still well defined by the skin, so it must not be
+        dropped, which would leave a lash facing its rest direction.
+        """
+        asset = Asset()
+        skin = asset.points[asset.skin]
+        cases = {
+            "one vertex": numpy.array([[2.0, 3.0, 0.4]]),
+            "two vertices": numpy.array([[2.0, 3.0, 0.4], [3.0, 3.0, 0.4]]),
+            "collinear row": numpy.column_stack([
+                numpy.linspace(1.5, 4.5, 9), numpy.full(9, 3.0), numpy.full(9, 0.4)]),
+        }
+        r, t = self.rotation(13), numpy.array([-2.0, 5.0, 1.0])
+
+        for label, points in cases.items():
+            points = points + ORIGIN_OFFSET
+            binding = self.skin_binding(asset, points)
+            labels = numpy.zeros(len(points), dtype=int)
+            for stiffness in (0.0, 0.5, 1.0):
+                out = shell.evaluate_binding(
+                    binding, skin.dot(r.T) + t, stiffness=stiffness, shell_labels=labels)
+                numpy.testing.assert_allclose(
+                    out, points.dot(r.T) + t, atol=1e-7,
+                    err_msg="{} at stiffness {}".format(label, stiffness))
+
+    def test_rank_deficient_skin_rings_are_excluded(self):
+        """An unmerged or wire-edge skin vertex must not inject a bad rotation."""
+        asset = Asset()
+        skin = asset.points[asset.skin].copy()
+        connectivity = [[j for j in asset.connectivity[i]] for i in asset.skin]
+
+        # collapse a skin vertex onto a neighbour, a classic unmerged vertex
+        skin[10] = skin[connectivity[10][0]]
+
+        followers = asset.points[asset.cards[0]]
+        binding = shell.build_binding(followers, skin, connectivity)
+        self.assertFalse(bool(binding["ring_valid"].all()),
+                         "the collapsed ring should be flagged")
+
+        r, t = self.rotation(17), numpy.array([1.0, 2.0, -3.0])
+        out = shell.evaluate_binding(binding, skin.dot(r.T) + t, stiffness=1.0,
+                                     shell_labels=numpy.zeros(len(followers), dtype=int))
+        numpy.testing.assert_allclose(out, followers.dot(r.T) + t, atol=1e-7)
+
+    def test_shells_the_author_left_static_do_not_move(self):
+        """A jaw open shape must not drag a deliberately still eyebrow."""
+        asset = Asset()
+        shape = asset.points.copy()
+        skin = asset.points[asset.skin]
+        centre = skin.mean(axis=0)
+        r = numpy.linalg.norm(skin[:, :2] - centre[:2], axis=1)
+        shape[asset.skin, 1] -= 0.7 * numpy.clip(1.0 - (r / 3.5) ** 2, 0.0, None) ** 3
+
+        moved = numpy.linalg.norm(shape[asset.followers]
+                                  - asset.points[asset.followers], axis=1).max()
+        self.assertEqual(moved, 0.0, "the fixture must author static followers")
+
+        t = asset.transfer()
+        points, _, _ = t.calculate_points(shape, "jawOpen")
+        target = asset.target()
+        drift = numpy.abs(points[asset.followers] - target[asset.followers]).max()
+        self.assertLess(drift, 1e-9, "static shells drifted by {:.4f}".format(drift))
+
+    def test_shape_that_moves_only_the_shells_is_transferred(self):
+        """A brow flick authored only on the cards must not vanish."""
+        asset = Asset()
+        shape = asset.points.copy()
+        delta = numpy.array([0.0, 0.30, 0.12])
+        for ids in asset.cards:
+            shape[ids] += delta
+
+        skin_moved = numpy.abs(shape[asset.skin] - asset.points[asset.skin]).max()
+        self.assertEqual(skin_moved, 0.0, "the fixture must leave the skin alone")
+
+        t = asset.transfer()
+        points, _, _ = t.calculate_points(shape, "browFlick")
+        target = asset.target()
+
+        for index, ids in enumerate(asset.cards):
+            moved = points[ids].mean(axis=0) - target[ids].mean(axis=0)
+            self.assertGreater(
+                numpy.linalg.norm(moved), 0.5 * numpy.linalg.norm(delta),
+                "card {} did not receive the authored motion, got {}".format(index, moved))
+            # and it stayed rigid
+            self.assertLess(
+                numpy.abs(pairwise(points[ids]) - pairwise(target[ids])).max(), 1e-9)
+
+        # the lash was untouched by the author, so it must not have moved
+        self.assertLess(numpy.abs(points[asset.lash] - target[asset.lash]).max(), 1e-9)
+
+    def test_pure_follow_mode_still_available(self):
+        asset = Asset()
+        t = asset.transfer(preserve_source_offset=False)
+        self.assertFalse(t.preserve_source_offset)
+        points, _, _ = t.calculate_points(asset.shape(), "browRaise")
+        self.assertTrue(numpy.all(numpy.isfinite(points)))
 
 
 class TestNumericalRobustness(unittest.TestCase):
