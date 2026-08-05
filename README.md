@@ -38,6 +38,53 @@ transfer.execute_from_mesh(mesh, name)
 transfer.execute_from_blend_shape()
 ```
 
+## Detached shells
+A mesh can be made up of several detached shells, for example a face with 
+separate eyebrow cards and eyelash strips. Those shells cannot be part of the 
+solve. The deformation gradient operator is translation invariant, so it fixes 
+positions only up to one free translation per connected component, and that 
+freedom is removed using the static zero-delta vertices. A shell in which every 
+vertex moves has no anchor, its block of the normal matrix is singular, and the 
+shell loses its position completely while keeping its shape, which is why it 
+used to end up at the object origin.
+
+The largest shell is treated as the skin and solved as before. Every other shell 
+is taken out of the solve and its motion is derived from the solved skin 
+instead, which also keeps sliver-heavy geometry such as eyelashes away from the 
+per-triangle QR inverse and the area based smoothing weights, both of which are 
+ill conditioned for slivers.
+
+How a shell follows is controlled per shell by its stiffness. A stiffness of 1 
+moves it with a single rigid transform, preserving its shape exactly while its 
+position and orientation track the skin, which is what eyebrow cards need. A 
+stiffness of 0 lets it deform with the skin through a smooth blended field, 
+which is what eyelash strips need so they stay attached to a lid that changes 
+shape. Press *Analyse shells* in the ui to list the shells, use *Select* to see 
+which is which in the viewport, and set the follow mode per row.
+
+```python
+transfer = transfer_blend_shape.Transfer(source_mesh, target_mesh)
+for shell in transfer.get_shell_description():
+    print(shell["index"], shell["role"], shell["vertices"])
+
+transfer.set_shell_stiffness(1.0)             # rigid, the default for all shells
+transfer.set_shell_stiffness(0.0, index=1)    # let shell 1 deform, eg the lashes
+transfer.execute_from_blend_shape()
+```
+
+Following gives a shell the motion implied by the skin underneath it. When a 
+modeller has deliberately pushed a card further than the skin, that intent is 
+not part of the skin and is lost. Enabling `preserve_source_offset` measures 
+the leftover rigid motion on the source and transplants it onto the target.
+
+The transfer still creates one mesh per shape, exactly as before. The maths runs 
+without a Maya session, so it is covered by tests that can be run directly:
+
+```
+python tests/offline/test_shells.py        # regression suite
+python tests/offline/diagnose_world_zero.py  # root cause demonstration
+```
+
 Display UI:
 ```python
 import transfer_blend_shape.gui

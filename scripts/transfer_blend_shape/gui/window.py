@@ -32,7 +32,7 @@ class TransferBlendShapeWidget(QtWidgets.QWidget):
         self.setWindowFlags(QtCore.Qt.Window)
         self.setWindowTitle(WINDOW_TITLE)
         self.setWindowIcon(QtGui.QIcon(WINDOW_ICON))
-        self.resize(450 * scale_factor, 25 * scale_factor)
+        self.resize(450 * scale_factor, 380 * scale_factor)
 
         # create layout
         layout = QtWidgets.QGridLayout(self)
@@ -127,19 +127,62 @@ class TransferBlendShapeWidget(QtWidgets.QWidget):
                                            "the deformed vertices and the smoothing weights.")
         layout.addWidget(self.create_colour_sets, 6, 1, 1, 2)
 
+        # create source offset widgets
+        offset_text = QtWidgets.QLabel(self)
+        offset_text.setText("Source offset:")
+        layout.addWidget(offset_text, 7, 0)
+
+        self.preserve_source_offset = QtWidgets.QCheckBox(self)
+        self.preserve_source_offset.stateChanged.connect(self.set_preserve_source_offset)
+        self.preserve_source_offset.setToolTip(
+            "Following gives a shell the motion of the skin underneath it. Enable this "
+            "to also carry over motion the source author added on top of that, for "
+            "example a brow card deliberately pushed further than the skin.")
+        layout.addWidget(self.preserve_source_offset, 7, 1, 1, 2)
+
         div = widgets.DividerWidget(self)
-        layout.addWidget(div, 7, 0, 1, 3)
+        layout.addWidget(div, 8, 0, 1, 3)
+
+        # create detached shell widgets
+        shell_text = QtWidgets.QLabel(self)
+        shell_text.setText("Detached shells:")
+        layout.addWidget(shell_text, 9, 0)
+
+        self.shell_info = QtWidgets.QLabel(self)
+        self.shell_info.setText("set a target mesh...")
+        layout.addWidget(self.shell_info, 9, 1)
+
+        shell_button = QtWidgets.QPushButton(self)
+        shell_button.setText("Analyse shells")
+        shell_button.setFixedSize(button_size)
+        shell_button.released.connect(self.populate_shells)
+        layout.addWidget(shell_button, 9, 2)
+
+        self.shells = QtWidgets.QTreeWidget(self)
+        self.shells.setHeaderLabels(["Shell", "Vertices", "Follow", ""])
+        self.shells.setRootIsDecorated(False)
+        self.shells.setAlternatingRowColors(True)
+        self.shells.setMinimumHeight(120 * scale_factor)
+        self.shells.setToolTip(
+            "Rigid keeps a shell's shape exactly and only moves and rotates it with the "
+            "skin, which is what eyebrow cards need. Smooth lets it deform with the skin "
+            "so it stays attached to a lid that changes shape, which is what eyelash "
+            "strips need.")
+        layout.addWidget(self.shells, 10, 0, 1, 3)
+
+        div = widgets.DividerWidget(self)
+        layout.addWidget(div, 11, 0, 1, 3)
 
         # create transfer widgets
         self.transfer_selection = QtWidgets.QPushButton(self)
         self.transfer_selection.setText("Transfer selection")
         self.transfer_selection.released.connect(self.transfer_from_selection)
-        layout.addWidget(self.transfer_selection, 8, 0, 1, 3)
+        layout.addWidget(self.transfer_selection, 12, 0, 1, 3)
 
         self.transfer_blend_shape = QtWidgets.QPushButton(self)
         self.transfer_blend_shape.setText("Transfer from blend shape")
         self.transfer_blend_shape.released.connect(self.transfer_from_blend_shape)
-        layout.addWidget(self.transfer_blend_shape, 9, 0, 1, 3)
+        layout.addWidget(self.transfer_blend_shape, 13, 0, 1, 3)
 
         self.reset()
 
@@ -208,6 +251,79 @@ class TransferBlendShapeWidget(QtWidgets.QWidget):
         """
         self.transfer.set_create_colour_sets(bool(state))
 
+    def set_preserve_source_offset(self, state):
+        """
+        :param int state:
+        """
+        self.transfer.set_preserve_source_offset(bool(state))
+
+    # ------------------------------------------------------------------------
+
+    @common.display_error
+    def populate_shells(self):
+        """
+        List the target's detached shells and expose a follow mode for each. The
+        largest shell is the skin and is solved normally, everything after it is
+        followed. Selecting a row's vertices in the viewport is the quickest way
+        to tell which index is the brows and which is the lashes.
+
+        :raise RuntimeError: When no target mesh is set.
+        """
+        self.shells.clear()
+
+        if not self.transfer.target_mesh:
+            raise RuntimeError("Unable to analyse shells, no target mesh set.")
+
+        description = self.transfer.get_shell_description()
+        followers = [item for item in description if item["role"] == "follower"]
+        self.shell_info.setText(
+            "{} shell{}, {} followed".format(
+                len(description), "" if len(description) == 1 else "s", len(followers)))
+
+        for item in description:
+            widget = QtWidgets.QTreeWidgetItem(self.shells)
+            widget.setText(0, "{} ({})".format(item["index"], item["role"]))
+            widget.setText(1, str(item["vertices"]))
+
+            if item["role"] == "skin":
+                widget.setText(2, "solved")
+                continue
+
+            combo = QtWidgets.QComboBox(self.shells)
+            combo.addItems(["Rigid", "Smooth", "Half"])
+            combo.setCurrentIndex(0 if item["stiffness"] >= 1.0
+                                  else 1 if item["stiffness"] <= 0.0 else 2)
+            combo.currentIndexChanged.connect(
+                lambda index, shell=item["index"]: self.set_shell_stiffness(shell, index))
+            self.shells.setItemWidget(widget, 2, combo)
+
+            button = QtWidgets.QPushButton(self.shells)
+            button.setText("Select")
+            button.released.connect(
+                lambda shell=item["index"]: self.select_shell(shell))
+            self.shells.setItemWidget(widget, 3, button)
+
+        for column in range(4):
+            self.shells.resizeColumnToContents(column)
+
+    def set_shell_stiffness(self, shell, index):
+        """
+        :param int shell: Shell index.
+        :param int index: Combo box index, rigid/smooth/half.
+        """
+        self.transfer.set_shell_stiffness([1.0, 0.0, 0.5][index], index=shell)
+
+    @common.display_error
+    def select_shell(self, shell):
+        """
+        Select a shell's vertices so the artist can see which shell a row is.
+
+        :param int shell: Shell index.
+        """
+        vertices = self.transfer.get_shells()[shell]
+        cmds.select(["{}.vtx[{}]".format(self.transfer.target_mesh, index)
+                     for index in vertices])
+
     # ------------------------------------------------------------------------
 
     @common.display_error
@@ -231,6 +347,11 @@ class TransferBlendShapeWidget(QtWidgets.QWidget):
         is_valid = self.transfer.is_valid()
         self.transfer_selection.setEnabled(is_valid)
         self.transfer_blend_shape.setEnabled(bool(is_valid and self.transfer.is_valid_with_blend_shape()))
+
+        # the shell list belongs to whichever target was set, so drop it
+        self.shells.clear()
+        self.shell_info.setText("set a target mesh..." if not self.transfer.target_mesh
+                                else "press analyse shells...")
 
 
 def show():
