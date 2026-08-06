@@ -923,12 +923,14 @@ class Transfer(object):
 
         target_points, smoothing_weights, deformed_vertices = self.calculate_points(points, name)
         if target_points is None:
-            target = cmds.duplicate(self.target_mesh, name=name)[0]
+            target = cmds.ls(cmds.duplicate(self.target_mesh, name=name)[0], long=True)[0]
             log.info("Transferred '{}' as a static mesh.".format(name))
             return target
 
-        # duplicate the original target and update its points
-        target = cmds.duplicate(self.target_mesh, name=name)[0]
+        # duplicate the original target and update its points. duplicate hands
+        # back a short name, which stops being unique once a previous transfer
+        # has already put a set of results in the scene.
+        target = cmds.ls(cmds.duplicate(self.target_mesh, name=name)[0], long=True)[0]
         target_dag = api.conversion.get_dag(target)
         target_dag.extendToShape()
         target_fn = OpenMaya.MFnMesh(target_dag)
