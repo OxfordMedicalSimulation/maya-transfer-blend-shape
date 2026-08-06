@@ -84,6 +84,22 @@ extra push. With it off, the card only ever does what the skin does.
 - Leave the brows on **Rigid**. Set the lashes to **Smooth**.
 - Transfer one shape that moves the brows, and one blink.
 
+## Known limitations — please don't report these
+
+Two behaviours are understood and deliberately left alone. Fixing either means
+reworking maths that currently works, and the judgement was that it isn't worth
+the risk for the improvement it would buy.
+
+**Brows come through slightly too far, or not quite far enough.** Which way it
+goes depends on the shape. Carrying an authored offset from one head to another
+leaves a small error that can land either side of correct — around ten percent
+on test geometry. Expect to correct brow shapes by hand.
+
+**Eyelids over-correct on heavy brow shapes.** This is the original solver, not
+the new detached-shell handling; the previous version does exactly the same. If
+it's bad on a particular shape, try lowering **Iterations** (default 3) — that
+controls the smoothing pass driving it, and costs nothing to experiment with.
+
 ## What to report
 
 - Anything sitting away from the head — at the origin or otherwise
@@ -91,7 +107,8 @@ extra push. With it off, the card only ever does what the skin does.
   perfectly rigid.
 - Lashes tearing, spiking, or stair-stepping along the lid
 - Lashes peeling off a lid that's changing shape
-- A shape where the brows should move but don't, or shouldn't move but do
+- A shape where the brows move that plainly shouldn't touch them at all — as
+  opposed to moving by the wrong amount, which is the known limitation above
 - A shell count or ordering that doesn't match the geometry
 
 Worth including: which head, which shape, the shell count and row numbers from
