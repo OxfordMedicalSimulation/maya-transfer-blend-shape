@@ -133,6 +133,7 @@ class TransferBlendShapeWidget(QtWidgets.QWidget):
         layout.addWidget(offset_text, 7, 0)
 
         self.preserve_source_offset = QtWidgets.QCheckBox(self)
+        self.preserve_source_offset.setChecked(self.transfer.preserve_source_offset)
         self.preserve_source_offset.stateChanged.connect(self.set_preserve_source_offset)
         self.preserve_source_offset.setToolTip(
             "Following gives a shell the motion of the skin underneath it. Enable this "
