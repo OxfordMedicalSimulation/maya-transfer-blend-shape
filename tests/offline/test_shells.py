@@ -593,6 +593,75 @@ class TestReviewFindings(unittest.TestCase):
         # the lash was untouched by the author, so it must not have moved
         self.assertLess(numpy.abs(points[asset.lash] - target[asset.lash]).max(), 1e-9)
 
+    def test_single_noisy_vertex_does_not_wake_a_static_shell(self):
+        """Float32 noise on one card vertex must not hand the shell to following.
+
+        The guard used to ask whether *any* vertex cleared Transfer.threshold, so
+        a single vertex of quantisation noise moved the whole card by a fraction
+        of the skin's motion. Reported from production as brows moving on shapes
+        that never touched them.
+        """
+        asset = Asset()
+        shape = asset.points.copy()
+        skin = asset.points[asset.skin]
+        centre = skin.mean(axis=0)
+        r = numpy.linalg.norm(skin[:, :2] - centre[:2], axis=1)
+        shape[asset.skin, 1] -= 0.7 * numpy.clip(1.0 - (r / 3.5) ** 2, 0.0, None) ** 3
+
+        # one vertex of one card nudged just past the old threshold of 1e-3
+        noisy = asset.cards[0][0]
+        shape[noisy] += numpy.array([0.0, 1.5e-3, 0.0])
+
+        t = asset.transfer()
+        points, _, _ = t.calculate_points(shape, "jawOpen")
+        target = asset.target()
+
+        drift = numpy.abs(points[asset.cards[0]] - target[asset.cards[0]]).max()
+        self.assertLess(drift, 1e-9,
+                        "one noisy vertex moved the card by {:.5f}".format(drift))
+
+    def test_a_genuinely_moved_shell_is_still_detected(self):
+        """The static guard must not swallow real authored motion."""
+        asset = Asset()
+        shape = asset.points.copy()
+        delta = numpy.array([0.0, 0.05, 0.0])
+        shape[asset.cards[0]] += delta
+
+        t = asset.transfer()
+        points, _, _ = t.calculate_points(shape, "browNudge")
+        target = asset.target()
+
+        moved = numpy.linalg.norm(
+            points[asset.cards[0]].mean(axis=0) - target[asset.cards[0]].mean(axis=0))
+        self.assertGreater(moved, 0.5 * numpy.linalg.norm(delta),
+                           "authored motion was swallowed, got {:.5f}".format(moved))
+
+    def test_near_degenerate_source_shell_does_not_explode(self):
+        """A tiny but uncollapsed source shell must not scale the offset by its ratio.
+
+        The size guard was absolute (1e-12), so a shell a thousandth of the
+        target's size multiplied the authored displacement by a thousand, while
+        an exactly collapsed shell was handled correctly.
+        """
+        card = numpy.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+                            [1.0, 1.0, 0.0]], dtype=float)
+        labels = numpy.zeros(len(card), dtype=int)
+        authored_delta = numpy.array([0.0, 0.3, 0.0])
+
+        for scale in (1.0, 1e-2, 1e-3, 1e-6):
+            rest = card * scale
+            predicted = rest.copy()
+            authored = rest + authored_delta
+            followed = card.copy()          # target shell stays at full size
+
+            out = shell.transplant_source_offset(
+                followed, predicted, authored, rest, labels)
+
+            moved = numpy.linalg.norm(out.mean(axis=0) - followed.mean(axis=0))
+            self.assertLess(
+                moved, 10.0 * numpy.linalg.norm(authored_delta),
+                "source shell at scale {:g} moved the target by {:.3f}".format(scale, moved))
+
     def test_pure_follow_mode_still_available(self):
         asset = Asset()
         t = asset.transfer(preserve_source_offset=False)

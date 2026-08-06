@@ -64,6 +64,12 @@ log = logging.getLogger(__name__)
 
 EPS = 1e-12
 
+# A source shell with almost no extent cannot establish a scale for an authored
+# displacement, and the target/source ratio then explodes. Grooms differ between
+# characters, but nothing like this much, so a ratio beyond it means the source
+# shell is degenerate rather than genuinely small.
+MAX_SIZE_RATIO = 10.0
+
 
 # ----------------------------------------------------------------------------
 # topology
@@ -441,8 +447,19 @@ def transplant_source_offset(followed, predicted, authored, rest, shell_labels):
         source_size = numpy.linalg.norm(shell_rest - shell_rest.mean(axis=0), axis=1).mean()
         target_size = numpy.linalg.norm(
             followed[indices] - followed[indices].mean(axis=0), axis=1).mean()
-        if source_size > EPS:
-            displacement = displacement * (target_size / source_size)
+        # EPS is absolute, so a shell that was small but not collapsed passed
+        # straight through it and scaled the displacement by the full ratio: a
+        # source card a thousandth of the target's size multiplied the authored
+        # motion by a thousand. An exactly collapsed shell took the degenerate
+        # branch above and came out right, a nearly collapsed one did not.
+        if source_size > EPS and target_size > EPS:
+            ratio = target_size / source_size
+            if 1.0 / MAX_SIZE_RATIO <= ratio <= MAX_SIZE_RATIO:
+                displacement = displacement * ratio
+            else:
+                log.warning("Shell %s has a target/source size ratio of %.3g, which is "
+                            "outside the plausible range. Transplanting its authored "
+                            "displacement unscaled.", label, ratio)
 
         centre = followed[indices].mean(axis=0)
         out[indices] = ((followed[indices] - centre).dot(rotation.T)

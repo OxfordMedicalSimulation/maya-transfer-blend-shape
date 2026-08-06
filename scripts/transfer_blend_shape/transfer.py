@@ -19,6 +19,12 @@ log = logging.getLogger(__name__)
 
 EPS = 1e-12
 
+# Fraction of a shell's own size below which its mean authored displacement is
+# read as the author not having moved it. Relative so it holds at any scene
+# scale, and independent of Transfer.threshold so lowering that to pick up a
+# subtle shape does not also narrow this guard.
+STATIC_SHELL_FRACTION = 1e-3
+
 
 class Transfer(object):
     """
@@ -789,13 +795,22 @@ class Transfer(object):
 
         # A shell the author left untouched must stay untouched. Following would
         # otherwise drag a static eyebrow along with a moving jaw, where the
-        # original tool left it alone. Deltas are measured on the source with the
-        # same threshold used to pick the static vertices.
+        # original tool left it alone.
+        #
+        # The test is the shell's *mean* displacement against a tolerance
+        # relative to its own size. Testing whether any single vertex cleared
+        # Transfer.threshold meant one vertex carrying float32 quantisation
+        # noise handed the whole shell to the follow path, which then moved it
+        # by a fraction of the skin's motion rather than by the noise.
         deltas = scipy.linalg.norm(points[followers] - source_points[followers], axis=1)
         rest = binding["follower_rest"]
+        authored_rest = source_points[followers]
         for label in numpy.unique(labels):
             indices = numpy.nonzero(labels == label)[0]
-            if not numpy.any(deltas[indices] > self.threshold):
+            shell_rest = authored_rest[indices]
+            size = numpy.linalg.norm(shell_rest - shell_rest.mean(axis=0), axis=1).mean()
+            tolerance = max(self.threshold, STATIC_SHELL_FRACTION * size)
+            if deltas[indices].mean() <= tolerance:
                 followed[indices] = rest[indices]
 
         if not numpy.all(numpy.isfinite(followed)):
