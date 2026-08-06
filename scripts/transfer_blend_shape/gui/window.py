@@ -202,7 +202,7 @@ class TransferBlendShapeWidget(QtWidgets.QWidget):
         """
         :raise RuntimeError: When nothing is selected.
         """
-        selection = cmds.ls(selection=True)
+        selection = cmds.ls(selection=True, long=True)
         if not selection:
             raise RuntimeError("Unable to set source mesh, nothing selected.")
 
@@ -215,7 +215,7 @@ class TransferBlendShapeWidget(QtWidgets.QWidget):
         """
         :raise RuntimeError: When nothing is selected.
         """
-        selection = cmds.ls(selection=True)
+        selection = cmds.ls(selection=True, long=True)
         if not selection:
             raise RuntimeError("Unable to set target mesh, nothing selected.")
 
@@ -227,7 +227,7 @@ class TransferBlendShapeWidget(QtWidgets.QWidget):
     def set_virtual_from_selection(self):
         """
         """
-        selection = cmds.ls(selection=True)
+        selection = cmds.ls(selection=True, long=True)
         virtual_mesh = selection[0] if selection else None
         virtual_mesh_name = naming.get_name(selection[0]) if selection else None
         self.transfer.set_virtual_mesh(virtual_mesh)
@@ -331,7 +331,7 @@ class TransferBlendShapeWidget(QtWidgets.QWidget):
     def transfer_from_selection(self):
         with common.WaitCursor():
             with undo.UndoChunk():
-                for node in cmds.ls(selection=True):
+                for node in cmds.ls(selection=True, long=True):
                     self.transfer.execute_from_mesh(node)
 
     @common.display_error

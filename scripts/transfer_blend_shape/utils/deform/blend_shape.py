@@ -10,7 +10,7 @@ def get_blend_shape(node):
     :return: Blend shape
     :rtype: str
     """
-    nodes = cmds.listRelatives(node, shapes=True) or []
+    nodes = cmds.listRelatives(node, shapes=True, fullPath=True) or []
     nodes.append(node)
 
     for history in cmds.listHistory(nodes):
