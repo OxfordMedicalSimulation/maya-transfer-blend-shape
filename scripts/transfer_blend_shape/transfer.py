@@ -12,9 +12,18 @@ from transfer_blend_shape.utils import colour
 from transfer_blend_shape.utils import conversion
 from transfer_blend_shape.utils import decorator
 from transfer_blend_shape.utils import naming
+from transfer_blend_shape.utils import shell
 from transfer_blend_shape.utils.deform import blend_shape
 
 log = logging.getLogger(__name__)
+
+EPS = 1e-12
+
+# Fraction of a shell's own size below which its mean authored displacement is
+# read as the author not having moved it. Relative so it holds at any scene
+# scale, and independent of Transfer.threshold so lowering that to pick up a
+# subtle shape does not also narrow this guard.
+STATIC_SHELL_FRACTION = 1e-3
 
 
 class Transfer(object):
@@ -22,6 +31,20 @@ class Transfer(object):
     Deformation transfer applies the deformation exhibited by a source mesh
     onto a different target mesh. The transfer can be aided by a virtual
     mesh that creates additional triangles.
+
+    A mesh made of several detached shells, for example a face with separate
+    eyebrow cards and eyelash strips, cannot be solved as one system. The
+    deformation gradient operator is translation invariant, so it fixes vertex
+    positions only up to one free translation per connected component, and that
+    freedom is removed using the static zero-delta vertices. A shell in which
+    every vertex moves therefore has no anchor, making its block of the normal
+    matrix singular and losing its position completely.
+
+    Rather than solve those shells, their motion is derived from the solved
+    skin, see :mod:`transfer_blend_shape.utils.shell`. That also keeps
+    sliver-heavy geometry such as eyelashes out of the per-triangle solve and
+    out of the area based smoothing, both of which are ill conditioned for
+    slivers.
     """
 
     def __init__(
@@ -31,7 +54,11 @@ class Transfer(object):
             virtual_mesh=None,
             iterations=3,
             threshold=0.001,
-            create_colour_sets=False
+            create_colour_sets=False,
+            shell_stiffness=1.0,
+            shell_neighbours=8,
+            preserve_source_offset=True,
+            solve_detached_shells=False
     ):
         self._source_mesh = None
         self._target_mesh = None
@@ -39,6 +66,11 @@ class Transfer(object):
         self._threshold = 0.001
         self._iterations = 3
         self._create_colour_sets = False
+        self._shell_stiffness = 1.0
+        self._shell_stiffness_overrides = {}
+        self._shell_neighbours = 8
+        self._preserve_source_offset = True
+        self._solve_detached_shells = False
 
         self.set_source_mesh(source_mesh)
         self.set_virtual_mesh(virtual_mesh)
@@ -46,6 +78,10 @@ class Transfer(object):
         self.set_iterations(iterations)
         self.set_threshold(threshold)
         self.set_create_colour_sets(create_colour_sets)
+        self.set_shell_stiffness(shell_stiffness)
+        self.set_shell_neighbours(shell_neighbours)
+        self.set_preserve_source_offset(preserve_source_offset)
+        self.set_solve_detached_shells(solve_detached_shells)
 
     # ------------------------------------------------------------------------
 
@@ -106,6 +142,7 @@ class Transfer(object):
         self.get_source_triangles.clear()
         self.get_source_area.clear()
         self.get_virtual_triangles.clear()
+        self.get_source_shell_binding.clear()
 
     # ------------------------------------------------------------------------
 
@@ -171,6 +208,10 @@ class Transfer(object):
         self.get_target_points.clear()
         self.get_target_connectivity.clear()
         self.get_target_matrix.clear()
+        self.get_shells.clear()
+        self.get_target_shell_binding.clear()
+        self.get_source_shell_binding.clear()
+        self._shell_stiffness_overrides = {}
 
     # ------------------------------------------------------------------------
 
@@ -280,6 +321,263 @@ class Transfer(object):
             raise TypeError("Unable to set colour set creation state, should be of type bool.")
 
         self._create_colour_sets = state
+
+    # ------------------------------------------------------------------------
+
+    @property
+    def shell_stiffness(self):
+        """
+        :return: Default follower shell stiffness
+        :rtype: float
+        """
+        return self._shell_stiffness
+
+    def set_shell_stiffness(self, stiffness, index=None):
+        """
+        Control how a detached shell follows the solved skin. A stiffness of 1
+        moves the shell with a single rigid transform, preserving its shape
+        exactly while its position and orientation track the skin, which is what
+        eyebrow cards need. A stiffness of 0 lets the shell deform with the skin
+        via a smooth blended field, which is what eyelash strips need so they
+        stay attached along a lid that changes shape.
+
+        :param float stiffness: Value between 0 and 1.
+        :param int/None index: Shell index to apply to, all shells when None.
+        :raise TypeError: When stiffness is not a float or int.
+        :raise ValueError: When stiffness is outside of the 0 to 1 range.
+        """
+        if not isinstance(stiffness, (float, int)) or isinstance(stiffness, bool):
+            raise TypeError("Unable to set shell stiffness, should be of type int/float.")
+        elif not 0.0 <= stiffness <= 1.0:
+            raise ValueError("Shell stiffness has to be between 0.0 and 1.0.")
+
+        if index is None:
+            self._shell_stiffness = float(stiffness)
+            self._shell_stiffness_overrides = {}
+        else:
+            self._shell_stiffness_overrides[int(index)] = float(stiffness)
+
+    def get_shell_stiffness(self, index):
+        """
+        :param int index: Shell index.
+        :return: Stiffness for the provided shell.
+        :rtype: float
+        """
+        return self._shell_stiffness_overrides.get(int(index), self._shell_stiffness)
+
+    @property
+    def shell_neighbours(self):
+        """
+        :return: Number of skin vertices blended per follower vertex
+        :rtype: int
+        """
+        return self._shell_neighbours
+
+    def set_shell_neighbours(self, num):
+        """
+        :param int num:
+        :raise TypeError: When num is not an int.
+        :raise ValueError: When num is lower than 1.
+        """
+        if not isinstance(num, int) or isinstance(num, bool):
+            raise TypeError("Unable to set shell neighbours, should be of type int.")
+        elif num < 1:
+            raise ValueError("Shell neighbours has to be 1 or higher.")
+
+        self._shell_neighbours = num
+        self.get_target_shell_binding.clear()
+        self.get_source_shell_binding.clear()
+
+    @property
+    def preserve_source_offset(self):
+        """
+        :return: Preserve source offset state
+        :rtype: bool
+        """
+        return self._preserve_source_offset
+
+    def set_preserve_source_offset(self, state):
+        """
+        Transfer a shell's motion *relative* to the skin rather than simply
+        replaying the skin's motion, which is on by default.
+
+        Following alone gives a shell exactly the motion implied by the skin
+        underneath it, so anything the author did on top of that is dropped. Two
+        cases make that visible. A shape that moves only the eyebrow cards and
+        leaves the skin alone has nothing to follow and transfers as a no-op.
+        A shape that moves the jaw while deliberately holding the brows still
+        drags the brows along with the cheek.
+
+        Measuring the leftover rigid motion on the source and transplanting it
+        onto the target covers both, and reduces to plain following whenever the
+        author did move the shell with the skin.
+
+        :param bool state:
+        :raise TypeError: When state is not a bool.
+        """
+        if not isinstance(state, bool):
+            raise TypeError("Unable to set preserve source offset state, should be of type bool.")
+
+        self._preserve_source_offset = state
+
+    @property
+    def solve_detached_shells(self):
+        """
+        :return: Solve detached shells state
+        :rtype: bool
+        """
+        return self._solve_detached_shells
+
+    def set_solve_detached_shells(self, state):
+        """
+        Escape hatch that restores the original behaviour of pushing every shell
+        through the linear solve. Only useful for comparison, an unanchored
+        shell will lose its position.
+
+        :param bool state:
+        :raise TypeError: When state is not a bool.
+        """
+        if not isinstance(state, bool):
+            raise TypeError("Unable to set solve detached shells state, should be of type bool.")
+
+        self._solve_detached_shells = state
+
+    # ------------------------------------------------------------------------
+
+    @decorator.memoize
+    def get_shells(self):
+        """
+        Connected components of the target mesh, ordered by descending vertex
+        count. Index 0 is the skin, everything after it is a detached follower
+        shell such as an eyebrow card or eyelash strip.
+
+        :return: Per-shell vertex indices
+        :rtype: list[numpy.Array]
+        :raise RuntimeError: When target is not defined.
+        """
+        labels, order = shell.connected_components(self.get_target_connectivity())
+        shells = [numpy.nonzero(labels == label)[0] for label in order]
+
+        if len(shells) > 1:
+            log.info("Target '%s' has %d shells, the largest (%d vertices) is treated as "
+                     "the skin and the other %d are followed.",
+                     self.target_mesh, len(shells), len(shells[0]), len(shells) - 1)
+
+        return shells
+
+    def get_skin_vertices(self):
+        """
+        :return: Vertex indices of the largest shell
+        :rtype: numpy.Array
+        """
+        return self.get_shells()[0]
+
+    def get_follower_vertices(self):
+        """
+        :return: Vertex indices of every shell but the largest
+        :rtype: numpy.Array
+        """
+        shells = self.get_shells()
+        if len(shells) == 1:
+            return numpy.array([], dtype=numpy.int64)
+
+        return numpy.sort(numpy.concatenate(shells[1:]))
+
+    def get_follower_shell_labels(self):
+        """
+        :return: Per-follower-vertex shell index, matching the vertex order of
+            :meth:`get_follower_vertices`.
+        :rtype: numpy.Array
+        """
+        followers = self.get_follower_vertices()
+        labels = numpy.zeros(len(followers), dtype=numpy.int64)
+        for index, vertices in enumerate(self.get_shells()):
+            if not index:
+                continue
+
+            labels[numpy.isin(followers, vertices)] = index
+
+        return labels
+
+    def get_shell_description(self):
+        """
+        Human readable summary of the detected shells, used for logging and to
+        populate the interface so an artist can tell which index is which.
+
+        :return: Per-shell index, vertex count, size and stiffness
+        :rtype: list[dict]
+        """
+        target_points = self.get_target_points()
+
+        description = []
+        for index, vertices in enumerate(self.get_shells()):
+            points = target_points[vertices]
+            size = points.max(axis=0) - points.min(axis=0)
+            description.append({
+                "index": index,
+                "vertices": len(vertices),
+                "centre": points.mean(axis=0),
+                "size": float(numpy.linalg.norm(size)),
+                "stiffness": None if not index else self.get_shell_stiffness(index),
+                "role": "skin" if not index else "follower",
+            })
+
+        return description
+
+    def get_shell_connectivity(self, vertices):
+        """
+        Remap the target connectivity onto a shell's local vertex order. Shells
+        are disjoint by definition, so every neighbour is inside the shell.
+
+        :param numpy.Array vertices: Shell vertex indices.
+        :return: Local per-vertex connectivity
+        :rtype: list[list[int]]
+        """
+        connectivity = self.get_target_connectivity()
+        remap = numpy.full(len(connectivity), -1, dtype=numpy.int64)
+        remap[vertices] = numpy.arange(len(vertices))
+        return [[int(remap[other]) for other in connectivity[index]] for index in vertices]
+
+    @decorator.memoize
+    def get_target_shell_binding(self):
+        """
+        :return: Follower binding built on the target rest pose
+        :rtype: dict/None
+        """
+        followers = self.get_follower_vertices()
+        if not len(followers):
+            return None
+
+        skin = self.get_skin_vertices()
+        target_points = self.get_target_points()
+        return shell.build_binding(
+            target_points[followers],
+            target_points[skin],
+            self.get_shell_connectivity(skin),
+            self.shell_neighbours,
+        )
+
+    @decorator.memoize
+    def get_source_shell_binding(self):
+        """
+        Equivalent binding on the source rest pose, only needed to measure the
+        authored offset when :attr:`preserve_source_offset` is enabled.
+
+        :return: Follower binding built on the source rest pose
+        :rtype: dict/None
+        """
+        followers = self.get_follower_vertices()
+        if not len(followers):
+            return None
+
+        skin = self.get_skin_vertices()
+        source_points = self.get_source_points()
+        return shell.build_binding(
+            source_points[followers],
+            source_points[skin],
+            self.get_shell_connectivity(skin),
+            self.shell_neighbours,
+        )
 
     # ------------------------------------------------------------------------
 
@@ -413,8 +711,22 @@ class Transfer(object):
         """
         source_area = self.get_source_area()
         target_area = self.calculate_area(points)
-        weights = numpy.dstack((source_area, target_area))
-        weights = numpy.max(weights.transpose(), axis=0) / numpy.min(weights.transpose(), axis=0) - 1
+
+        # a fully degenerate vertex, every surrounding triangle a sliver, has an
+        # area of zero. Dividing by it yields inf or nan, which the smoothing
+        # loop below then spreads across the shell and which finally lands in
+        # the vertex positions. Sliver triangles are exactly what eyelash
+        # geometry is made of, so guard the ratio rather than trust the input.
+        numerator = numpy.maximum(source_area, target_area)
+        denominator = numpy.minimum(source_area, target_area)
+        valid = denominator > EPS
+        weights = numpy.zeros(len(points), dtype=float)
+        weights[valid] = numerator[valid] / denominator[valid] - 1.0
+
+        degenerate = int(numpy.count_nonzero(~valid))
+        if degenerate:
+            log.debug("Skipping smoothing weights for %d degenerate vertices.", degenerate)
+
         smoothing_matrix = self.calculate_laplacian_matrix(numpy.ones(len(points)), ignore)
 
         for _ in range(self.iterations):
@@ -451,6 +763,162 @@ class Transfer(object):
 
         return scipy.sparse.coo_matrix((columns, (data, rows)), shape=(num, num)).tocsr()
 
+    def calculate_follower_points(self, binding, skin_points, points, name=None):
+        """
+        Derive the positions of every detached shell from the solved skin.
+
+        :param dict binding: Target rest pose binding.
+        :param numpy.Array skin_points: Solved skin positions.
+        :param numpy.Array points: Source deformed points, full mesh order.
+        :param str/None name: Target name, used for error reporting.
+        :return: Follower positions, matching :meth:`get_follower_vertices`.
+        :rtype: numpy.Array
+        :raise RuntimeError: When the derived positions are not finite.
+        """
+        labels = self.get_follower_shell_labels()
+        stiffness = {int(label): self.get_shell_stiffness(int(label))
+                     for label in numpy.unique(labels)}
+
+        followers = self.get_follower_vertices()
+        source_points = self.get_source_points()
+        followed = shell.evaluate_binding(binding, skin_points, stiffness, labels)
+
+        if self.preserve_source_offset:
+            predicted = shell.evaluate_binding(
+                self.get_source_shell_binding(),
+                points[self.get_skin_vertices()],
+                stiffness,
+                labels,
+            )
+            followed = shell.transplant_source_offset(
+                followed, predicted, points[followers], source_points[followers], labels)
+
+        # A shell the author left untouched must stay untouched. Following would
+        # otherwise drag a static eyebrow along with a moving jaw, where the
+        # original tool left it alone.
+        #
+        # The test is the shell's *mean* displacement against a tolerance
+        # relative to its own size. Testing whether any single vertex cleared
+        # Transfer.threshold meant one vertex carrying float32 quantisation
+        # noise handed the whole shell to the follow path, which then moved it
+        # by a fraction of the skin's motion rather than by the noise.
+        deltas = scipy.linalg.norm(points[followers] - source_points[followers], axis=1)
+        rest = binding["follower_rest"]
+        authored_rest = source_points[followers]
+        for label in numpy.unique(labels):
+            indices = numpy.nonzero(labels == label)[0]
+            shell_rest = authored_rest[indices]
+            size = numpy.linalg.norm(shell_rest - shell_rest.mean(axis=0), axis=1).mean()
+            tolerance = max(self.threshold, STATIC_SHELL_FRACTION * size)
+            if deltas[indices].mean() <= tolerance:
+                followed[indices] = rest[indices]
+
+        if not numpy.all(numpy.isfinite(followed)):
+            raise RuntimeError("Derived non-finite positions for the detached shells of "
+                               "target '{}'.".format(name))
+
+        return followed
+
+    # ------------------------------------------------------------------------
+
+    def calculate_points(self, points, name=None):
+        """
+        Solve the target positions for a single source shape. This is the entire
+        numerical pipeline with no scene interaction, which keeps it testable
+        without a Maya session.
+
+        :param numpy.Array points: Source deformed points.
+        :param str/None name: Target name, used for error reporting.
+        :return: Solved target points, smoothing weights and deformed vertices.
+            The points are None when the shape holds no deltas at all.
+        :rtype: tuple[numpy.Array/None, numpy.Array/None, numpy.Array]
+        :raise RuntimeError: When vertex count doesn't match between source and target.
+        :raise RuntimeError: When no static vertices are found.
+        :raise RuntimeError: When the solve produces non-finite positions.
+        """
+        source_points = self.get_source_points()
+        target_points = self.get_target_points()
+        if source_points.shape[0] != target_points.shape[0]:
+            raise RuntimeError("Vertex count between source mesh '{}' and target mesh '{}' "
+                               "do not match.".format(self.source_mesh, self.target_mesh))
+
+        static_vertices, deformed_vertices = self.filter_vertices(points)
+        if not len(static_vertices):
+            raise RuntimeError("No static vertices found for target '{}', "
+                               "try increasing the threshold".format(name))
+        elif not len(deformed_vertices):
+            return None, None, deformed_vertices
+
+        # detached shells are removed from the solve. The gradient operator is
+        # translation invariant, so a shell containing no static vertex has an
+        # undetermined translation and a singular normal matrix. Left in, its
+        # zero pivot produces nan that back substitution then spreads through
+        # the whole coupled system.
+        follower_vertices = self.get_follower_vertices()
+        binding = None if self.solve_detached_shells else self.get_target_shell_binding()
+        if binding is None:
+            follower_vertices = numpy.array([], dtype=numpy.int64)
+            solve_vertices = deformed_vertices
+        else:
+            solve_vertices = numpy.setdiff1d(deformed_vertices, follower_vertices)
+
+        skin_vertices = self.get_skin_vertices()
+        if len(follower_vertices) and not len(numpy.intersect1d(static_vertices, skin_vertices)):
+            raise RuntimeError("No static vertices found on the skin shell for target '{}', "
+                               "the solve has nothing to anchor to. Try increasing the "
+                               "threshold.".format(name))
+
+        target_points = target_points.copy()
+        if len(solve_vertices):
+            target_matrix = self.get_target_matrix()
+
+            # calculate deformation gradient, the static vertices are used to
+            # anchor the static vertices in place.
+            static_matrix = target_matrix[:, static_vertices]
+            static_points = target_points[static_vertices, :]
+            static_gradient = numpy.dot(static_matrix, static_points)
+            deformation_gradient = self.calculate_deformation_gradient(points) - static_gradient
+
+            # isolate dynamic vertices and solve their position. As it is quicker
+            # to set all points rather than individual ones the entire target
+            # point list is constructed.
+            deformed_matrix = target_matrix[:, solve_vertices]
+            deformed_matrix_transpose = deformed_matrix.transpose()
+            normal_matrix = numpy.dot(deformed_matrix_transpose, deformed_matrix)
+            lu, piv = scipy.linalg.lu_factor(normal_matrix)
+            uts = numpy.dot(deformed_matrix_transpose, deformation_gradient)
+            deformed_points = scipy.linalg.lu_solve((lu, piv), uts)
+
+            if not numpy.all(numpy.isfinite(deformed_points)):
+                raise RuntimeError(
+                    "Solve for target '{}' produced non-finite positions, so the system is "
+                    "singular. Either a detached shell has no static vertex to anchor it, "
+                    "or the mesh has vertices that belong to no face, for example a stray "
+                    "wire edge, whose position nothing constrains.".format(name))
+
+            target_points[solve_vertices, :] = deformed_points
+
+        # calculate the laplacian smoothing weights/matrix using the
+        # per-vertex area difference, this will ensure area's with most
+        # highest difference receive the most smoothing, these are applied
+        # to the calculated points. Follower vertices are held out, their
+        # positions are derived rather than solved, and sliver triangles make
+        # the area ratio meaningless anyway.
+        ignore = (static_vertices if not len(follower_vertices)
+                  else numpy.union1d(static_vertices, follower_vertices))
+        smoothing_weights = self.calculate_laplacian_weights(points, ignore)
+        smoothing_matrix = self.calculate_laplacian_matrix(smoothing_weights, ignore)
+        for _ in range(self.iterations):
+            diff = numpy.array(smoothing_matrix.dot(target_points))
+            target_points = target_points - diff
+
+        # derive the detached shells from the solved skin
+        if binding is not None:
+            target_points[follower_vertices, :] = self.calculate_follower_points(
+                binding, target_points[skin_vertices], points, name)
+
+        return target_points, smoothing_weights, deformed_vertices
+
     # ------------------------------------------------------------------------
 
     def execute(self, points, name):
@@ -468,54 +936,16 @@ class Transfer(object):
         if not self.is_valid():
             raise RuntimeError("Invalid transfer, set at least source and target.")
 
-        source_points = self.get_source_points()
-        target_points = self.get_target_points()
-        if source_points.shape[0] != target_points.shape[0]:
-            raise RuntimeError("Vertex count between source mesh '{}' and target mesh '{}' "
-                               "do not match.".format(self.source_mesh, self.target_mesh))
-
-        static_vertices, deformed_vertices = self.filter_vertices(points)
-        if not len(static_vertices):
-            raise RuntimeError("No static vertices found for target '{}', "
-                               "try increasing the threshold".format(name))
-        elif not len(deformed_vertices):
-            target = cmds.duplicate(self.target_mesh, name=name)[0]
+        target_points, smoothing_weights, deformed_vertices = self.calculate_points(points, name)
+        if target_points is None:
+            target = cmds.ls(cmds.duplicate(self.target_mesh, name=name)[0], long=True)[0]
             log.info("Transferred '{}' as a static mesh.".format(name))
             return target
 
-        target_matrix = self.get_target_matrix()
-
-        # calculate deformation gradient, the static vertices are used to
-        # anchor the static vertices in place.
-        static_matrix = target_matrix[:, static_vertices]
-        static_points = target_points[static_vertices, :]
-        static_gradient = numpy.dot(static_matrix, static_points)
-        deformation_gradient = self.calculate_deformation_gradient(points) - static_gradient
-
-        # isolate dynamic vertices and solve their position. As it is quicker
-        # to set all points rather than individual ones the entire target
-        # point list is constructed.
-        deformed_matrix = target_matrix[:, deformed_vertices]
-        deformed_matrix_transpose = deformed_matrix.transpose()
-        lu, piv = scipy.linalg.lu_factor(numpy.dot(deformed_matrix_transpose, deformed_matrix))
-        uts = numpy.dot(deformed_matrix_transpose, deformation_gradient)
-        deformed_points = scipy.linalg.lu_solve((lu, piv), uts)
-
-        target_points = target_points.copy()
-        target_points[deformed_vertices, :] = deformed_points
-
-        # calculate the laplacian smoothing weights/matrix using the
-        # per-vertex area difference, this will ensure area's with most
-        # highest difference receive the most smoothing, these are applied
-        # to the calculated points
-        smoothing_weights = self.calculate_laplacian_weights(points, static_vertices)
-        smoothing_matrix = self.calculate_laplacian_matrix(smoothing_weights, static_vertices)
-        for _ in range(self.iterations):
-            diff = numpy.array(smoothing_matrix.dot(target_points))
-            target_points = target_points - diff
-
-        # duplicate the original target and update its points
-        target = cmds.duplicate(self.target_mesh, name=name)[0]
+        # duplicate the original target and update its points. duplicate hands
+        # back a short name, which stops being unique once a previous transfer
+        # has already put a set of results in the scene.
+        target = cmds.ls(cmds.duplicate(self.target_mesh, name=name)[0], long=True)[0]
         target_dag = api.conversion.get_dag(target)
         target_dag.extendToShape()
         target_fn = OpenMaya.MFnMesh(target_dag)
